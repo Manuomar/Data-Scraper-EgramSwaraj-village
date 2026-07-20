@@ -44,10 +44,13 @@ _thread_local = threading.local()
 _success_counter = {"n": 0}
 _counter_lock = threading.Lock()
 
-# DB Queue for Background Insertion
+# DB Queue for Background Insertion — bounded to avoid memory buildup
 # Items in queue: (village_code, data_list, is_complete)
 # Sentinel to stop: None
-_db_queue = queue.Queue()
+_db_queue = queue.Queue(maxsize=MAX_WORKERS * 4)
+
+_stats = {"db_saved": 0, "empty": 0, "failed": 0}
+_stats_lock = threading.Lock()
 
 # Months to pull vouchers for (financial year months, April=4 ... March=3)
 MONTHS = config.VOUCHER_MONTHS
@@ -56,6 +59,7 @@ MONTHS = config.VOUCHER_MONTHS
 def _db_writer_worker():
     """Background thread to handle MySQL inserts asynchronously."""
     print("[DB_WORKER] Started DB writer thread.")
+    conn = Voucher_Wise_Summary_Report_DB._connect()
     while True:
         item = _db_queue.get()
         if item is None:
@@ -66,16 +70,22 @@ def _db_writer_worker():
         
         try:
             if data_batch:
-                Voucher_Wise_Summary_Report_DB.insertData(data_batch)
+                Voucher_Wise_Summary_Report_DB.insertData(data_batch, conn=conn)
+                with _stats_lock:
+                    _stats["db_saved"] += len(data_batch)
+            elif is_complete:
+                with _stats_lock:
+                    _stats["empty"] += 1
             
             if is_complete:
-                Approved_Action_Plan_Report_DB.updateVoucherDetails(village_code)
-                print(f"[DB_WORKER] Marked village {village_code} as COMPLETED in DB.")
+                # Same persistent conn se village done mark karo
+                Approved_Action_Plan_Report_DB.updateVoucherDetails(village_code, conn=conn)
         except Exception as e:
             print(f"[DB_WORKER] ERROR for village {village_code}: {e}")
             
         _db_queue.task_done()
         
+    conn.close()
     print("[DB_WORKER] DB writer thread stopped.")
 
 
@@ -251,6 +261,9 @@ def process_village(row):
                 if detail:
                     detail["village_code"] = village_code
                     voucher_data_batch.append(detail)
+                else:
+                    village_success = False
+                    print(f"[WARNING] Network error for voucher detail in village {village_code}. Won't mark as done.")
                     
                 # Queue large batches to avoid massive memory usage per village
                 if len(voucher_data_batch) >= INSERT_BATCH_SIZE:
@@ -267,6 +280,9 @@ def extractData(district_filter=None):
     district_filter: District name string (e.g. 'Agra'), case-insensitive.
                       None = sab districts (poora UP).
     """
+    # Tables ek baar banao scraping se pehle
+    Voucher_Wise_Summary_Report_DB.ensureTables()
+
     data = Approved_Action_Plan_Report_DB.getData2(district_filter=district_filter)
     dataSetLen = len(data)
 
@@ -293,19 +309,34 @@ def extractData(district_filter=None):
         completed_count += 1
         try:
             future.result()
-            if completed_count % 10 == 0 or completed_count == dataSetLen:
-                print(f"[PROGRESS] Completed processing {completed_count}/{dataSetLen} villages")
         except Exception as e:
             print(f"[ERROR] Exception processing village {row['village_code']}: {e}")
+            with _stats_lock:
+                _stats["failed"] += 1
+
+        if completed_count % 100 == 0 or completed_count == dataSetLen:
+            with _stats_lock:
+                saved  = _stats["db_saved"]
+                empty  = _stats["empty"]
+                failed = _stats["failed"]
+            print(
+                f"[PROGRESS] Villages: {completed_count}/{dataSetLen} | "
+                f"Vouchers Saved: {saved} | Empty: {empty} | Failed: {failed}"
+            )
 
     executor.shutdown(wait=True)
 
     # Stop DB writer thread
-    print("All villages scraped. Waiting for DB queue to finish inserts...")
+    print("All villages scraped. Waiting for DB queue to flush...")
     _db_queue.put(None)
     db_thread.join()
-    
-    print("Voucher-Wise Summary done.")
+
+    with _stats_lock:
+        print(
+            f"\n[DONE] Voucher-Wise Summary finished."
+            f" Villages={dataSetLen} | Vouchers Saved={_stats['db_saved']}"
+            f" | Empty={_stats['empty']} | Failed={_stats['failed']}"
+        )
 
 
 if __name__ == "__main__":

@@ -139,18 +139,21 @@ def getData2(district_filter=None):
     return result
 
 
-def updateVoucherDetails(village_code):
+def updateVoucherDetails(village_code, conn=None):
     """Village ko 'voucher fetch ho gaya' mark karta hai (crash-safe resume)."""
-    conn = _connect()
-    cursor = conn.cursor(dictionary=True)
-    _ensure_table(cursor)
+    close_conn = False
+    if conn is None:
+        conn = _connect()
+        close_conn = True
+    cursor = conn.cursor()
     cursor.execute(
         "UPDATE approved_action_plan_report SET get_voucher_details=1 WHERE village_code=%s",
         (village_code,),
     )
     conn.commit()
     cursor.close()
-    conn.close()
+    if close_conn:
+        conn.close()
 
 
 def getVillageData(district_filter=None):
@@ -185,15 +188,18 @@ def getVillageData(district_filter=None):
     return result
 
 
-def updatePhotoUploadedData(village_code):
+def updatePhotoUploadedData(village_code, conn=None):
     """Village ko 'photo data fetch ho gaya' mark karta hai (crash-safe resume)."""
-    conn = _connect()
-    cursor = conn.cursor(dictionary=True)
-    _ensure_table(cursor)
+    close_conn = False
+    if conn is None:
+        conn = _connect()
+        close_conn = True
+    cursor = conn.cursor()
     cursor.execute(
         "UPDATE approved_action_plan_report SET get_photo_uploaded=1 WHERE village_code=%s",
         (village_code,),
     )
     conn.commit()
     cursor.close()
-    conn.close()
+    if close_conn:
+        conn.close()

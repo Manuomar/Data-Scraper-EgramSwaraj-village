@@ -28,39 +28,49 @@ def main():
     # STEP 1: Fetch Villages & Approved Action Plan
     # -----------------------------------------------------
     print("\n>>> PIPELINE STEP 1: Fetching Villages (Approved Action Plan Report)")
+    step1_start = time.time()
     try:
         run_step1_get_villages.run()
     except Exception as e:
         print(f"\n[ERROR in Step 1]: {e}")
         print("Pipeline aborted.")
         return
+    finally:
+        print(f"  [Step 1 Elapsed Time: {time.time() - step1_start:.2f} seconds]")
         
     # -----------------------------------------------------
     # STEP 2: Fetch Photo Uploaded Report
     # -----------------------------------------------------
     print("\n>>> PIPELINE STEP 2: Fetching M-ActionSoft Photo Uploaded Report")
+    # step2_start = time.time()
     # try:
     #     run_photo_uploaded(district_filter=config.DISTRICT_FILTER)
     # except Exception as e:
     #     print(f"\n[ERROR in Step 2]: {e}")
     #     print("Pipeline aborted.")
     #     return
+    # finally:
+    #     print(f"  [Step 2 Elapsed Time: {time.time() - step2_start:.2f} seconds]")
 
     # -----------------------------------------------------
     # STEP 3: Fetch Voucher Wise Summary
     # -----------------------------------------------------
     print("\n>>> PIPELINE STEP 3: Fetching Voucher-Wise Summary Report")
+    step3_start = time.time()
     try:
         run_voucher_pipeline.run()
     except Exception as e:
         print(f"\n[ERROR in Step 3]: {e}")
         print("Pipeline aborted.")
         return
+    finally:
+        print(f"  [Step 3 Elapsed Time: {time.time() - step3_start:.2f} seconds]")
         
     # -----------------------------------------------------
     # STEP 4: Fetch Activity Details
     # -----------------------------------------------------
     print("\n>>> PIPELINE STEP 4: Fetching View Activity Details Report")
+    step4_start = time.time()
     try:
         print("Starting Activity Details Extraction for Voucher Module...")
         run_activity_details()
@@ -69,11 +79,14 @@ def main():
         print(f"\n[ERROR in Step 4]: {e}")
         print("Pipeline aborted.")
         return
+    finally:
+        print(f"  [Step 4 Elapsed Time: {time.time() - step4_start:.2f} seconds]")
         
     # -----------------------------------------------------
     # STEP 5: Fetch Expenditure Details
     # -----------------------------------------------------
     print("\n>>> PIPELINE STEP 5: Fetching Expenditure Details Report")
+    step5_start = time.time()
     try:
         print("Starting Expenditure Details Extraction...")
         run_expenditure_details()
@@ -82,6 +95,8 @@ def main():
         print(f"\n[ERROR in Step 5]: {e}")
         print("Pipeline aborted.")
         return
+    finally:
+        print(f"  [Step 5 Elapsed Time: {time.time() - step5_start:.2f} seconds]")
 
     total_time = time.time() - start_time
     print("=" * 70)
@@ -90,9 +105,10 @@ def main():
 
 
 if __name__ == "__main__":
+    global_start = time.time()
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[STOP] Pipeline forcefully interrupted by user! Exiting immediately...")
+        print(f"\n[STOP] Pipeline forcefully interrupted by user after {time.time() - global_start:.2f} seconds! Exiting immediately...")
         import os
         os._exit(1)

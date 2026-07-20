@@ -43,12 +43,17 @@ _thread_local = threading.local()
 _success_counter = {"n": 0}
 _counter_lock = threading.Lock()
 
-_db_queue = queue.Queue()
+_stats = {"db_saved": 0, "empty": 0, "failed": 0}
+_stats_lock = threading.Lock()
+
+_db_queue = queue.Queue(maxsize=MAX_WORKERS * 4)
 
 
 def _db_writer_worker():
     """Background thread to handle MySQL inserts asynchronously."""
     print("[DB_WORKER] Started Photo Upload DB writer thread.")
+    conn = Approved_Action_Plan_Report_DB._connect()
+    
     while True:
         item = _db_queue.get()
         if item is None:
@@ -58,16 +63,23 @@ def _db_writer_worker():
         village_code, records = item
         
         try:
-            if records:
-                M_ActionSoft_Photo_Uploaded_Report_DB.insertData(records)
-            
-            # Always mark as fetched to avoid re-fetching broken pages
-            Approved_Action_Plan_Report_DB.updatePhotoUploadedData(village_code)
+            if records is not None:
+                if records:
+                    M_ActionSoft_Photo_Uploaded_Report_DB.insertData(records, conn=conn)
+                    with _stats_lock:
+                        _stats["db_saved"] += len(records)
+                else:
+                    with _stats_lock:
+                        _stats["empty"] += 1
+                
+                # Always mark as fetched to avoid re-fetching broken pages (only if no network error)
+                Approved_Action_Plan_Report_DB.updatePhotoUploadedData(village_code, conn=conn)
         except Exception as e:
             print(f"[DB_WORKER] ERROR for village {village_code}: {e}")
             
         _db_queue.task_done()
         
+    conn.close()
     print("[DB_WORKER] DB writer thread stopped.")
 
 
@@ -124,7 +136,7 @@ def _extractVillageLevelData(fyear, gpCode, session):
 
     response = _request_with_retry("post", url, session, data=payload)
     if response is None:
-        return []
+        return None
 
     soup = BeautifulSoup(response.text, "html.parser")
 
@@ -176,6 +188,12 @@ def _processVillage(row):
 
     try:
         records = _extractVillageLevelData(fyear, village_code, session)
+        if records is None:
+            with _stats_lock:
+                _stats["failed"] += 1
+            _db_queue.put((village_code, None))
+            return village_code
+            
         for item in records:
             item["fyear"] = fyear
             item["village_code"] = village_code
@@ -184,7 +202,9 @@ def _processVillage(row):
         return village_code
     except Exception as e:
         print(f"[ERROR] village={village_code} -> {e}")
-        _db_queue.put((village_code, []))
+        with _stats_lock:
+            _stats["failed"] += 1
+        _db_queue.put((village_code, None))
         return village_code
 
 
@@ -196,6 +216,8 @@ def extractData(district_filter=None):
     district_filter: District name string (e.g. 'Agra'), case-insensitive.
                       None = sab districts (poora UP).
     """
+    M_ActionSoft_Photo_Uploaded_Report_DB.ensureTable()
+    
     villageDataSet = Approved_Action_Plan_Report_DB.getVillageData(district_filter=district_filter)
     total = len(villageDataSet)
     
@@ -220,10 +242,17 @@ def extractData(district_filter=None):
         completed_count += 1
         try:
             future.result()
-            if completed_count % 10 == 0 or completed_count == total:
-                print(f"[PROGRESS] Completed processing {completed_count}/{total} villages")
         except Exception as e:
             print(f"[ERROR] Exception processing village {row['village_code']}: {e}")
+            with _stats_lock:
+                _stats["failed"] += 1
+                
+        if completed_count % 10 == 0 or completed_count == total:
+            with _stats_lock:
+                saved = _stats["db_saved"]
+                empty = _stats["empty"]
+                failed = _stats["failed"]
+            print(f"[PROGRESS] Completed processing {completed_count}/{total} villages | Saved: {saved} | Empty: {empty} | Failed: {failed}")
 
     executor.shutdown(wait=True)
 
@@ -231,7 +260,8 @@ def extractData(district_filter=None):
     _db_queue.put(None)
     db_thread.join()
 
-    print(f"Photo Upload report done. Processed {total} villages.")
+    with _stats_lock:
+        print(f"\n[DONE] Photo Upload report done. Processed {total} villages | Saved: {_stats['db_saved']} | Empty: {_stats['empty']} | Failed: {_stats['failed']}")
 
 
 if __name__ == "__main__":

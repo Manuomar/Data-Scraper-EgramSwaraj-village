@@ -13,10 +13,10 @@ def _connect():
     return mysql.connector.connect(**DB_CONFIG)
 
 
-def insertData(data):
+def ensureTables():
+    """Tables create karta hai agar exist nahi karti. Ek baar call karo script start pe."""
     conn = _connect()
     cursor = conn.cursor()
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS voucher_wise_summary_report (
         sno INT AUTO_INCREMENT PRIMARY KEY,
@@ -40,7 +40,6 @@ def insertData(data):
         UNIQUE KEY uq_voucher_url (voucher_details_url)
     )
     """)
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS voucher_wise_summary_report_payment (
         sno INT AUTO_INCREMENT PRIMARY KEY,
@@ -51,6 +50,17 @@ def insertData(data):
         amount DECIMAL(10,2)
     )
     """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def insertData(data, conn=None):
+    close_conn = False
+    if conn is None:
+        conn = _connect()
+        close_conn = True
+    cursor = conn.cursor()
 
     insert_query = """
     INSERT IGNORE INTO voucher_wise_summary_report (
@@ -120,7 +130,8 @@ def insertData(data):
 
     conn.commit()
     cursor.close()
-    conn.close()
+    if close_conn:
+        conn.close()
 
     if skipped:
         print(f"[insertData] {skipped} row(s) skipped due to errors out of {len(data)}")
@@ -159,13 +170,24 @@ def getActivityCodes():
     conn.close()
     return data
 
-def updateActivityDetailsFetched(activity_code):
-    conn = _connect()
+def updateActivityDetailsFetched(activity_code, conn=None):
+    if activity_code:
+        updateActivityDetailsFetchedBatch([activity_code], conn=conn)
+
+def updateActivityDetailsFetchedBatch(activity_codes, conn=None):
+    if not activity_codes:
+        return
+    close_conn = False
+    if conn is None:
+        conn = _connect()
+        close_conn = True
     cursor = conn.cursor()
-    cursor.execute("UPDATE voucher_wise_summary_report SET activity_details_fetched = 1 WHERE activity_code = %s", (activity_code,))
+    format_strings = ','.join(['%s'] * len(activity_codes))
+    cursor.execute(f"UPDATE voucher_wise_summary_report SET activity_details_fetched = 1 WHERE activity_code IN ({format_strings})", tuple(activity_codes))
     conn.commit()
     cursor.close()
-    conn.close()
+    if close_conn:
+        conn.close()
 
 
 def getExpenditurePendingActivities():
@@ -211,18 +233,22 @@ def getExpenditurePendingActivities():
     return data
 
 
-def updateExpenditureDetailsFetched(activity_code):
-    """Expenditure_Details_Report_fast.py ke liye:
-    Ek activity ko expenditure-fetched mark karta hai (crash-safe resume).
-    """
-    conn = _connect()
+def updateExpenditureDetailsFetched(activity_code, conn=None):
+    """Legacy single wrapper."""
+    if activity_code:
+        updateExpenditureDetailsFetchedBatch([activity_code], conn=conn)
+
+def updateExpenditureDetailsFetchedBatch(activity_codes, conn=None):
+    if not activity_codes:
+        return
+    close_conn = False
+    if conn is None:
+        conn = _connect()
+        close_conn = True
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE voucher_wise_summary_report "
-        "SET expenditure_details_fetched = 1 "
-        "WHERE activity_code = %s",
-        (activity_code,)
-    )
+    format_strings = ','.join(['%s'] * len(activity_codes))
+    cursor.execute(f"UPDATE voucher_wise_summary_report SET expenditure_details_fetched = 1 WHERE activity_code IN ({format_strings})", tuple(activity_codes))
     conn.commit()
     cursor.close()
-    conn.close()
+    if close_conn:
+        conn.close()

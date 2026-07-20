@@ -26,13 +26,14 @@ import config
 # ---------------------------------------------------------
 # TUNABLE SETTINGS
 # ---------------------------------------------------------
-MAX_WORKERS = config.MAX_WORKERS
-REQUEST_TIMEOUT = 25
+# MAX_WORKERS = config.MAX_WORKERS
+MAX_WORKERS = 30
+REQUEST_TIMEOUT = 45
 MAX_RETRIES = 4
 RETRY_BACKOFF = 2
 
-REQUESTS_PER_SECOND = 8.0
-BURST = 8
+REQUESTS_PER_SECOND = 10.0
+BURST = 10
 
 # ---------------------------------------------------------
 # Shared rate limiter + per-thread session
@@ -42,31 +43,73 @@ _thread_local = threading.local()
 _success_counter = {"n": 0}
 _counter_lock = threading.Lock()
 
-_db_queue = queue.Queue()
+# Bounded queue — agar DB slow ho toh threads wait karein (backpressure)
+_db_queue = queue.Queue(maxsize=MAX_WORKERS * 4)
+
+_stats = {"db_saved": 0, "empty": 0, "failed": 0}
+_stats_lock = threading.Lock()
 
 
 def _db_writer_worker():
-    """Background thread to handle MySQL inserts asynchronously."""
+    """Background thread to handle MySQL inserts asynchronously in bulk."""
     print("[DB_WORKER] Started Expenditure DB writer thread.")
+    
+    # Ek hi persistent connection — ek baar banta hai, saari activity inserts + updates isi pe
+    conn = Voucher_Wise_Summary_Report_DB._connect()
+    batch_size = 300
+    
     while True:
+        items = []
         item = _db_queue.get()
         if item is None:
             _db_queue.task_done()
             break
-            
-        activity_code, activity_data = item
+        items.append(item)
         
+        # Drain queue up to batch_size
+        while len(items) < batch_size:
+            try:
+                itm = _db_queue.get_nowait()
+                if itm is None:
+                    _db_queue.put(None)
+                    break
+                items.append(itm)
+            except queue.Empty:
+                break
+                
+        valid_data_list = []
+        activity_codes_to_mark = []
+        db_saved_count = 0
+        empty_count = 0
+        
+        for itm in items:
+            activity_code, activity_data = itm
+            if activity_data is not None:
+                activity_codes_to_mark.append(activity_code)
+                exp_rows = activity_data.get("Expenditure Details", [])
+                if exp_rows:
+                    valid_data_list.extend(exp_rows)
+                    db_saved_count += len(exp_rows)
+                else:
+                    empty_count += 1
+                    
         try:
-            if activity_data is not None and len(activity_data.get("Expenditure Details", [])) > 0:
-                Expenditure_Details_Report_DB.insertData(activity_data)
-            
-            # Always mark as fetched to avoid re-fetching broken pages
-            Voucher_Wise_Summary_Report_DB.updateExpenditureDetailsFetched(activity_code)
+            if valid_data_list:
+                Expenditure_Details_Report_DB.insertDataBatch(valid_data_list, conn=conn)
+                
+            if activity_codes_to_mark:
+                Voucher_Wise_Summary_Report_DB.updateExpenditureDetailsFetchedBatch(activity_codes_to_mark, conn=conn)
+                
+            with _stats_lock:
+                _stats["db_saved"] += db_saved_count
+                _stats["empty"] += empty_count
         except Exception as e:
-            print(f"[DB_WORKER] ERROR for activity {activity_code}: {e}")
+            print(f"[DB_WORKER] BATCH ERROR: {e}")
             
-        _db_queue.task_done()
-        
+        for _ in items:
+            _db_queue.task_done()
+            
+    conn.close()
     print("[DB_WORKER] DB writer thread stopped.")
 
 
@@ -188,6 +231,8 @@ def _processActivity(row):
     try:
         activityData = _extractExpenditureData(activity_code, session)
         if activityData is None:
+            with _stats_lock:
+                _stats["failed"] += 1
             _db_queue.put((activity_code, None))
             return activity_code
 
@@ -202,6 +247,8 @@ def _processActivity(row):
 
     except Exception as e:
         print(f"[ERROR] expenditure_activity={activity_code} -> {e}")
+        with _stats_lock:
+            _stats["failed"] += 1
         _db_queue.put((activity_code, None))
         return activity_code
 
@@ -211,8 +258,8 @@ def extractData():
     Voucher_Wise_Summary_Report table se pending activity codes uthata hai
     aur unka expenditure detail fetch karke DB mein daalta hai.
     """
-    # Create empty table just in case there are no pending activities
-    Expenditure_Details_Report_DB.insertData({})
+    # Create table once at the start, not on every insertData call
+    Expenditure_Details_Report_DB.ensureTable()
     
     data = Voucher_Wise_Summary_Report_DB.getExpenditurePendingActivities()
     total = len(data)
@@ -237,18 +284,31 @@ def extractData():
         except Exception as e:
             activity_code = "Unknown"
             print(f"[ERROR] Worker exception -> {e}")
+            with _stats_lock:
+                _stats["failed"] += 1
 
-        remaining = total - done
-        if done % 10 == 0 or remaining < 10:
-            print(f"[{remaining} left] Completed scraping expenditure_activity={activity_code}")
+        if done % 100 == 0 or done == total:
+            with _stats_lock:
+                saved  = _stats["db_saved"]
+                empty  = _stats["empty"]
+                failed = _stats["failed"]
+            print(
+                f"[PROGRESS] Scraped {done}/{total} | "
+                f"DB Rows Saved: {saved} | Empty: {empty} | Failed: {failed}"
+            )
 
     executor.shutdown(wait=True)
 
-    print("All activities scraped. Waiting for DB queue to finish inserts...")
+    print("All activities scraped. Waiting for DB queue to flush...")
     _db_queue.put(None)
     db_thread.join()
 
-    print(f"Expenditure Details (EgramSwaraj) done. Processed {total} activities.")
+    with _stats_lock:
+        print(
+            f"\n[DONE] Expenditure Details finished."
+            f" Total={total} | DB Rows Saved={_stats['db_saved']}"
+            f" | Empty={_stats['empty']} | Failed={_stats['failed']}"
+        )
 
 
 if __name__ == "__main__":
@@ -258,4 +318,3 @@ if __name__ == "__main__":
         print("\n[STOP] Script forcefully interrupted by user! Exiting immediately...")
         import os
         os._exit(1)
-

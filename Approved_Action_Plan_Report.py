@@ -288,23 +288,25 @@ def extractAndInsertData(limit_blocks=None, district_filter=None):
     done = 0
     total_villages = 0
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_block = {executor.submit(_processBlock, b): b for b in blockDataSet}
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    future_to_block = {executor.submit(_processBlock, b): b for b in blockDataSet}
 
-        for future in as_completed(future_to_block):
-            block = future_to_block[future]
-            done += 1
-            try:
-                rows = future.result()
-            except Exception as e:
-                print(f"[ERROR] {block['block_panchayat']} -> {e}")
-                rows = []
+    for future in as_completed(future_to_block):
+        block = future_to_block[future]
+        done += 1
+        try:
+            rows = future.result()
+        except Exception as e:
+            print(f"[ERROR] {block['block_panchayat']} -> {e}")
+            rows = []
 
-            if rows:
-                total_villages += len(rows)
+        if rows:
+            total_villages += len(rows)
 
-            print(f"[{done}/{total}] {block['district_panchayat']} / {block['block_panchayat']} "
-                  f"-> {len(rows)} villages (total so far: {total_villages})")
+        print(f"[{done}/{total}] {block['district_panchayat']} / {block['block_panchayat']} "
+              f"-> {len(rows)} villages (total so far: {total_villages})")
+
+    executor.shutdown(wait=True)
 
     print("All blocks scraped. Waiting for DB queue to finish inserts...")
     _db_queue.put(None)

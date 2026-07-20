@@ -27,13 +27,14 @@ import config
 # ---------------------------------------------------------
 # TUNABLE SETTINGS
 # ---------------------------------------------------------
-MAX_WORKERS = config.MAX_WORKERS
-REQUEST_TIMEOUT = 25
+# MAX_WORKERS = config.MAX_WORKERS
+MAX_WORKERS = 20
+REQUEST_TIMEOUT = 45
 MAX_RETRIES = 4
 RETRY_BACKOFF = 2
 
-REQUESTS_PER_SECOND = 8.0
-BURST = 8
+REQUESTS_PER_SECOND = 10.0
+BURST = 10
 INSERT_BATCH_SIZE = 200   # activity detail records before flush
 
 # ---------------------------------------------------------
@@ -44,31 +45,73 @@ _thread_local = threading.local()
 _success_counter = {"n": 0}
 _counter_lock = threading.Lock()
 
-_db_queue = queue.Queue()
+# Bounded queue — agar DB slow ho toh threads wait karein (backpressure)
+# MAX_WORKERS * 3 se zyada pending items queue mein nahi rahenge
+_db_queue = queue.Queue(maxsize=MAX_WORKERS * 4)
+
+_stats = {"db_saved": 0, "empty": 0, "failed": 0}
+_stats_lock = threading.Lock()
 
 
 def _db_writer_worker():
-    """Background thread to handle MySQL inserts asynchronously."""
+    """Background thread to handle MySQL inserts asynchronously in bulk."""
     print("[DB_WORKER] Started View Activity DB writer thread.")
+    
+    # Ek hi persistent connection — ek baar banta hai, saari activity inserts + updates isi pe
+    conn = Voucher_Wise_Summary_Report_DB._connect()
+    batch_size = 300
+    
     while True:
+        items = []
         item = _db_queue.get()
         if item is None:
             _db_queue.task_done()
             break
-            
-        activity_code, activity_data = item
+        items.append(item)
         
-        try:
+        # Drain queue up to batch_size
+        while len(items) < batch_size:
+            try:
+                itm = _db_queue.get_nowait()
+                if itm is None:
+                    _db_queue.put(None)
+                    break
+                items.append(itm)
+            except queue.Empty:
+                break
+                
+        valid_data_list = []
+        activity_codes_to_mark = []
+        db_saved_count = 0
+        empty_count = 0
+        
+        for itm in items:
+            activity_code, activity_data, is_empty = itm
             if activity_data is not None:
-                View_Activity_Details_Report_DB.insertData(activity_data)
-            
-            # Always mark as fetched to avoid re-fetching broken pages
-            Voucher_Wise_Summary_Report_DB.updateActivityDetailsFetched(activity_code)
+                activity_codes_to_mark.append(activity_code)
+                if not is_empty:
+                    valid_data_list.append(activity_data)
+                    db_saved_count += 1
+                else:
+                    empty_count += 1
+                    
+        try:
+            if valid_data_list:
+                View_Activity_Details_Report_DB.insertDataBatch(valid_data_list, conn=conn)
+                
+            if activity_codes_to_mark:
+                Voucher_Wise_Summary_Report_DB.updateActivityDetailsFetchedBatch(activity_codes_to_mark, conn=conn)
+                
+            with _stats_lock:
+                _stats["db_saved"] += db_saved_count
+                _stats["empty"] += empty_count
         except Exception as e:
-            print(f"[DB_WORKER] ERROR for activity {activity_code}: {e}")
+            print(f"[DB_WORKER] BATCH ERROR: {e}")
             
-        _db_queue.task_done()
-        
+        for _ in items:
+            _db_queue.task_done()
+            
+    conn.close()
     print("[DB_WORKER] DB writer thread stopped.")
 
 
@@ -210,7 +253,7 @@ def _extractSingleData(activity_code, session):
 
 def _processActivity(row):
     """
-    Fetch detail for one activity. Returns (activity_code, activityData) or (code, None).
+    Fetch detail for one activity. Returns activity_code on completion.
     """
     activity_code = row["activity_code"]
     plan_code = row["plan_code"]
@@ -220,10 +263,13 @@ def _processActivity(row):
     try:
         activityData = _extractSingleData(activity_code, session)
         if activityData is None:
-            _db_queue.put((activity_code, None))
+            with _stats_lock:
+                _stats["failed"] += 1
+            _db_queue.put((activity_code, None, False))  # mark done, nothing to insert
             return activity_code
 
-        # ---- same post-processing as original ----
+        # ---- post-processing ----
+        has_data = False
         if "Activity Details" in activityData:
             merged_activity_details = {}
             for section in activityData["Activity Details"]:
@@ -235,12 +281,14 @@ def _processActivity(row):
                 item["village_code"] = village_code
                 item["plan_code"] = plan_code
                 item["activity_code"] = activity_code
+            has_data = True
 
         if "Fund Allocation" in activityData:
             for item in activityData["Fund Allocation"]:
                 item["village_code"] = village_code
                 item["plan_code"] = plan_code
                 item["activity_code"] = activity_code
+            has_data = True
 
         for optional_section in (
             "Technical Approval Details",
@@ -252,13 +300,17 @@ def _processActivity(row):
                     item["village_code"] = village_code
                     item["plan_code"] = plan_code
                     item["activity_code"] = activity_code
+                has_data = True
 
-        _db_queue.put((activity_code, activityData))
+        is_empty = not has_data
+        _db_queue.put((activity_code, activityData, is_empty))
         return activity_code
 
     except Exception as e:
         print(f"[ERROR] activity={activity_code} -> {e}")
-        _db_queue.put((activity_code, None))
+        with _stats_lock:
+            _stats["failed"] += 1
+        _db_queue.put((activity_code, None, False))
         return activity_code
 
 
@@ -266,6 +318,9 @@ def _processActivity(row):
 # Main entry point (same signature as original)
 # ---------------------------------------------------------
 def extractData():
+    # Pehle tables create kar lo takki har activity insert me CREATE TABLE na chale
+    View_Activity_Details_Report_DB.ensureTables()
+
     # Yaha par hum voucher wise summary report se activity codes le rahe hain
     data = Voucher_Wise_Summary_Report_DB.getActivityCodes()
     total = len(data)
@@ -286,21 +341,34 @@ def extractData():
     for future in as_completed(futures):
         done += 1
         try:
-            activity_code = future.result()
+            future.result()
         except Exception as e:
-            activity_code = "Unknown"
             print(f"[ERROR] Worker exception -> {e}")
 
-        remaining = total - done
-        if done % 10 == 0 or remaining == 0:
-            print(f"[{remaining} left] Completed scraping activity={activity_code}")
+        if done % 100 == 0 or done == total:
+            with _stats_lock:
+                saved  = _stats["db_saved"]
+                empty  = _stats["empty"]
+                failed = _stats["failed"]
+            q_pending = _db_queue.qsize()
+            print(
+                f"[PROGRESS] Scraped {done}/{total} | "
+                f"DB Saved: {saved} | Empty: {empty} | "
+                f"Failed: {failed} | Queue: {q_pending} pending"
+            )
 
     executor.shutdown(wait=True)
 
-    print("All activities scraped. Waiting for DB queue to finish inserts...")
+    print("All activities scraped. Waiting for DB queue to flush...")
     _db_queue.put(None)
     db_thread.join()
-    print(f"View Activity Details done. Processed {total} activities.")
+
+    with _stats_lock:
+        print(
+            f"\n[DONE] View Activity Details finished."
+            f" Total={total} | DB Saved={_stats['db_saved']}"
+            f" | Empty={_stats['empty']} | Failed={_stats['failed']}"
+        )
 
 
 if __name__ == "__main__":

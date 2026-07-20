@@ -1,87 +1,154 @@
-# Voucher Module
+# eGramSwaraj Data Scraper — Voucher Module
 
 **Step 1 (Villages & Action Plan)**, **Step 2 (Photo Uploaded Report)**, **Step 3 (Voucher-Wise Summary)**, **Step 4 (Activity Details)**, aur **Step 5 (Expenditure Details)** ko fetch karta hai.
- 
+
+---
+
 ## Folder Structure
 
 ```text
-voucher_module/
+DataScrap EgramSwaraj/
 │
-├── config.py                               ← MASTER CONFIG: DB settings, district filter, test mode, months, etc.
-├── run_full_pipeline.py                    ← MAIN SCRIPT: Yeh saare steps ek saath sequentially chalata hai
+├── config.py                                  ← MASTER CONFIG: DB, district filter, months, workers
+├── run_full_pipeline.py                       ← MAIN SCRIPT: Saare steps sequentially chalata hai
 │
-├── run_step1_get_villages.py               ← STEP 1: Village list & Approved Action Plan fetcher
+├── run_step1_get_villages.py                  ← STEP 1: Village list & Approved Action Plan fetcher
+├── run_voucher_pipeline.py                    ← STEP 3: Voucher pipeline runner (wrapper)
 ├── M_ActionSoft_Photo_Uploaded_Report_fast.py ← STEP 2: Photo Uploaded Report fetcher
-├── run_voucher_pipeline.py                 ← STEP 3: Voucher Wise Summary fetcher
-├── run_activity_details.py                 ← STEP 4 runner (wrapper)
-│
-├── Approved_Action_Plan_Report.py          ← Step 1 ka scraping logic
-├── Voucher_Wise_Summary_Report_fast.py     ← Step 3 ka scraping logic
-├── View_Activity_Details_Report_fast.py    ← Step 4 ka scraping logic
-├── Expenditure_Details_Report_fast.py      ← Step 5 ka scraping logic
-├── rate_limiter.py                         ← Shared token-bucket rate limiter
+├── Voucher_Wise_Summary_Report_fast.py        ← STEP 3: Voucher scraping logic (main)
+├── View_Activity_Details_Report_fast.py       ← STEP 4: Activity Details scraping logic
+├── Expenditure_Details_Report_fast.py         ← STEP 5: Expenditure Details scraping logic
+├── rate_limiter.py                            ← Shared token-bucket rate limiter
 │
 └── mysql_connector/
     ├── __init__.py
-    ├── Approved_Action_Plan_Report_DB.py   ← Table CREATE + INSERT (Step 1 DB Logic)
-    ├── Voucher_Wise_Summary_Report_DB.py   ← Voucher table CREATE + INSERT (Step 3 DB Logic)
-    ├── View_Activity_Details_Report_DB.py  ← Activity Details table (Step 4 DB Logic)
-    └── Expenditure_Details_Report_DB.py    ← Expenditure table CREATE + INSERT (Step 5 DB Logic)
+    ├── Approved_Action_Plan_Report_DB.py      ← Step 1 DB: CREATE + INSERT + status update
+    ├── Voucher_Wise_Summary_Report_DB.py      ← Step 3 DB: CREATE + INSERT + resume tracking
+    ├── View_Activity_Details_Report_DB.py     ← Step 4 DB: 5 tables + INSERT (activity, fund, approvals, progress)
+    └── Expenditure_Details_Report_DB.py       ← Step 5 DB: expenditure table + INSERT
 ```
+
+---
 
 ## Setup & Configuration (`config.py`)
 
-Sabse pehle `config.py` file ko open karo aur apni settings update karo. Ab alag-alag files mein modifications karne ki zaroorat nahi hai.
+Sabse pehle `config.py` file open karo aur apni settings set karo:
 
-1. **Database Config:** Apna MySQL details (password, database name) `DB_CONFIG` mein set karo.
-2. **Filters & State:** `STATE_CODE`, `FINANCIAL_YEAR`, aur `DISTRICT_FILTER` apne requirement ke hisaab se set karo.
-    - Example: `DISTRICT_FILTER = "Agra"` (Sirf Agra district ke liye)
-    - Example: `DISTRICT_FILTER = None` (Poore state ke liye)
-3. **Voucher Months:** `VOUCHER_MONTHS` set karo. Default mein poora saal `[4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3]` set hai.
-4. **Performance & Test Mode:** `MAX_WORKERS` parallel execution ke liye. Pehli baar run karne se pehle `TEST_MODE = True` aur `TEST_BLOCK_LIMIT = 1` set karke check kar sakte ho (1 block test).
+| Setting | Description |
+|---------|-------------|
+| `DB_CONFIG` | MySQL host, user, password, database name |
+| `STATE_CODE` | State code (9 = UP) |
+| `FINANCIAL_YEAR` | e.g. `"2026"` for FY 2026-27 |
+| `DISTRICT_FILTER` | `"Agra"` for one district, `None` for full state |
+| `VOUCHER_MONTHS` | e.g. `[4, 5, 6, 7]` (April to July) |
+| `MAX_WORKERS` | Thread count for parallel execution (default: 25) |
+| `TEST_MODE` | `True` for 1-block test run |
+
+---
 
 ## Kaise Chalao (How to Run)
 
-Ek baar `config.py` set hone ke baad, aap directly poori pipeline ek saath chala sakte ho:
+`config.py` set karne ke baad, poori pipeline ek command se chala do:
 
 ```bash
-cd "voucher_module"
+cd "DataScrap EgramSwaraj"
 python run_full_pipeline.py
 ```
 
-### Yeh kya karega?
-1. **STEP 1:** Pehle `run_step1_get_villages.py` execute hoga. Yeh `approved_action_plan_report` table banayega (agar nahi hai) aur villages ka data populate karega.
-2. **STEP 2:** Fir `M_ActionSoft_Photo_Uploaded_Report_fast.py` chalega, jo un villages ke uploaded photos ki details fetch karega.
-3. **STEP 3:** Phir `run_voucher_pipeline.py` chalega, jo sirf un villages ke vouchers layega jinke `get_voucher_details = 0` hai.
-4. **STEP 4:** Fir `View_Activity_Details_Report_fast.py` (Activity Details) run hoga, vouchers ki specific details extract karne ke liye.
-5. **STEP 5:** Last mein `Expenditure_Details_Report_fast.py` chalega, jo har activity ke expenditure details `view_activity_details_expenditure_details` table mein daalta hai.
+### Pipeline Steps
 
-**Crash-Safe Design:** Script beech mein ruk jaye to wapas `python run_full_pipeline.py` run karo, already processed villages aur vouchers skip ho jayenge aur jaha se ruka tha wahi se aage badhega.
+| Step | Script | Kya karta hai |
+|------|--------|---------------|
+| 1 | `run_step1_get_villages.py` | Villages fetch karta hai → `approved_action_plan_report` table |
+| 2 | `M_ActionSoft_Photo_Uploaded_Report_fast.py` | Photo upload data fetch karta hai *(Step 2 currently skipped in pipeline)* |
+| 3 | `run_voucher_pipeline.py` | Voucher-wise payment data → `voucher_wise_summary_report` table |
+| 4 | `View_Activity_Details_Report_fast.py` | Activity details (5 tables) → DB |
+| 5 | `Expenditure_Details_Report_fast.py` | Expenditure records → `view_activity_details_expenditure_details` |
 
-## 🚀 Recent Architectural Optimizations
-Haal hi mein saari 5 scraping files (`Voucher_Wise_Summary`, `View_Activity`, `Expenditure`, `Photo_Uploaded`, aur `Approved_Action_Plan`) mein major performance upgrades kiye gaye hain:
-1. **Asynchronous DB Queue:** DB inserts ko ab ek background worker thread (`_db_writer_worker`) handle karta hai. Isse main scraping threads block nahi hote, aur network I/O speed 5-10x badh gayi hai.
-2. **Persistent Connection Pooling:** Har worker thread ke paas apna `requests.Session` aur `HTTPAdapter` hai, jo TCP connections ko zinda rakhta hai (`pool_connections=1`). Isse website par baar-baar naye connection ban banane ka time bachta hai.
-3. **Global ThreadPoolExecutor:** Village ya activity level parsing parallel tarike se chalayi gayi hai.
-4. **Crash-Proof & Duplicate Prevention:** MySQL database files mein properly `UNIQUE KEY`s lagayi gayi hain aur queries mein `INSERT IGNORE` (ya atomic batch commits) ka use kiya gaya hai. Agar script crash ho jaye, to start karne par duplicate records nahi bante aur ruki hui jagah se flawlessly resume hoti hai.
+---
 
-## Individual Scripts Run Karna
+## Progress Output (kya dikhega)
 
-Agar aapko sirf specific step run karna hai (mostly debugging ya partial data fetch ke liye), to unko manually bhi chala sakte ho:
+Har script run hote waqt console (terminal) par yeh format mein real-time progress dikhayega:
+
+```
+[PROGRESS] Scraped 500/525608 | DB Saved: 487 | Empty: 8 | Failed: 5 | Queue: 12 pending
+```
+
+**Iska matlab kya hai?**
+- **DB Saved:** Actual data jo successful raha aur successfully MySQL mein save ho gaya.
+- **Empty:** Wo activities jinka request website pe gaya, lekin server ne koi data nahi diya (blank page / no records found). Yeh normal hai.
+- **Failed:** Network error, Server Timeout (503/504), ya crash jiski wajah se website connect hi nahi hui. *(Important: Yeh failed entries DB mein 'done' mark nahi hoti, dobara run karne pe script inhi se shuru hogi).*
+- **Queue pending:** Scraping threads kitni tezi se memory mein data bhar rahe hain jo abhi DB mein insert hona baaki hai. (Strict limit `80` rakhi gayi hai taaki memory full na ho, pehle ye lakhon me chali jati thi jisse crash hone pe data loss hota tha).
+
+Aur script khatam hone pe final summary:
+```
+[DONE] View Activity Details finished. Total=525608 | DB Saved=510000 | Empty=10000 | Failed=5608
+```
+
+---
+
+## Crash-Safe Design & Zero Data Loss
+
+Script beech mein rokne par (`Ctrl+C` se terminate karne par) ya server crash hone par **koi data loss nahi hoga:**
+
+- `os._exit(1)` instantly terminate karta hai taaki waiting queue freeze na ho.
+- Jo activities/villages DB mein successfully gayi aur jinka response mila (chahe blank ho), wahi `fetched = 1` mark hongi.
+- Jo network error ki wajah se fail hui (Failed count), unko `fetched` mark nahi kiya jayega. Dobara chalane pe directly wahin se attempt karegi.
+- `INSERT IGNORE` + `UNIQUE KEY` lagayi gayi hai, isliye duplicate records kabhi nahi banenge.
+
+---
+
+## Architecture & Optimizations (Technical Upgrade)
+
+Ye scripts highly optimized multi-threaded architecture par design ki gayi hain:
+
+1. **Persistent Connection Pooling:** Har DB worker ek single MySQL connection open rakhta hai (poori script ke liye). Isse connection open/close hone ka delay completely khatam ho gaya.
+2. **Consumer-Side Batching (Bulk Insert):** DB worker ab memory queue se ek ek activity insert nahi karta. Wo queue se ek baar mein **300 activities** ka batch uthata hai, aur MySQL ko **bulk insert (`executemany`)** bhejta hai. Jo process pehle 1800 queries leti thi, ab wo sirf 6 bulk queries me puri ho jati hai.
+3. **Bounded Backpressure Queue:** `queue.Queue(maxsize = MAX_WORKERS * 4)` lagaya gaya hai. Agar DB insert time le, toh fast scraping threads temporarily ruk jayenge. Memory bloat / OOM issue permanently fixed.
+4. **Token Bucket Rate Limiter (`rate_limiter.py`):** Server 429/503 de toh threads slow down hote hain (penalty), aur successful hone par dobara speed badha lete hain.
+
+---
+
+## DB Tables Created
+
+| Script | Tables |
+|--------|--------|
+| Step 1 | `approved_action_plan_report` |
+| Step 3 | `voucher_wise_summary_report`, `voucher_wise_summary_report_payment` |
+| Step 4 | `view_activity_details_activity_details`, `view_activity_details_fund_allocation`, `view_activity_details_technical_approval_details`, `view_activity_details_administrative_approval_details`, `view_activity_details_physical_progress_details` |
+| Step 5 | `view_activity_details_expenditure_details` |
+| Step 2 | `m_actionsoft_photo_uploaded_report` |
+
+---
+
+## Individual Scripts Chalana (Debug ke liye)
+
+Agar aapko manually koi ek step chalana ho:
 
 ```bash
 # Sirf Step 1: Villages List
 python run_step1_get_villages.py
 
-# Sirf Step 2: Photo Uploads
-python M_ActionSoft_Photo_Uploaded_Report_fast.py
-
 # Sirf Step 3: Voucher Summary
 python run_voucher_pipeline.py
 
 # Sirf Step 4: Activity Details
-python run_activity_details.py
+python View_Activity_Details_Report_fast.py
 
 # Sirf Step 5: Expenditure Details
 python Expenditure_Details_Report_fast.py
 ```
+
+---
+
+## Bug Fix History (Recent Core Updates)
+
+| Feature / Fix | Impact |
+|---------------|--------|
+| **Consumer-Side DB Batching** | MySQL Bulk inserts (`executemany`). Queue block (80 pending) issue resolved, inserts happen instantly in batches of 300. |
+| **Strict Network Failure Logic** | If server returns `None` (timeout), script no longer marks it as fetched. Prevents silent data-loss on crashes. |
+| **Voucher Sub-failure Logic** | Agar kisi ek village ke andar 1 particular voucher detail fail ho, toh poora village fail mark hoga taaki dobara load ho sake. |
+| **Photo Uploaded Upgrade** | Step 2 (M_ActionSoft) ab baaki files jaisa same Fast Architecture (persistent connection, bounded queue, real-time stats) use karta hai. |
+| **Bounded Queue (`maxsize`)** | Prevents RAM overload, if killed by user `Ctrl+C`, max 80 unprocessed items are dropped instead of 50,000+. |
+| **`ensureTables()` Optimization** | Removes Lakhs of redundant `CREATE TABLE IF NOT EXISTS` commands during extraction. |

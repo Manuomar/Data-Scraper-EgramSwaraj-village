@@ -19,11 +19,9 @@ def _connect():
     return mysql.connector.connect(**DB_CONFIG)
 
 
-def insertData(data):
+def ensureTable():
     conn = _connect()
     cursor = conn.cursor()
-
-    # Create table if not exists
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS m_actionsoft_photo_uploaded_report (
         sno INT AUTO_INCREMENT PRIMARY KEY,
@@ -42,6 +40,17 @@ def insertData(data):
         UNIQUE KEY uq_photo (village_code, activity_code, image_url, uploaded_date)
     )
     """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def insertData(data, conn=None):
+    close_conn = False
+    if conn is None:
+        conn = _connect()
+        close_conn = True
+    cursor = conn.cursor()
 
     insert_query = """
     INSERT IGNORE INTO m_actionsoft_photo_uploaded_report (
@@ -77,4 +86,5 @@ def insertData(data):
 
     conn.commit()
     cursor.close()
-    conn.close()
+    if close_conn:
+        conn.close()
